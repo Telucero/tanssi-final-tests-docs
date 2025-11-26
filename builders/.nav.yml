@@ -9,3 +9,4 @@ nav:
   - account-management
   - interoperability
   - tanssi-network
+  - dummy-sample  # test3 variant (line differs from other branches)

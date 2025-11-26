@@ -1,6 +1,6 @@
-# Dummy Sample Page
+# Dummy Sample Page (test3 variant)
 
-This placeholder page demonstrates how a section under `learn/` can include its own `.nav.yml` file.
+This version intentionally diverges from earlier branches to exercise merge conflict handling.
 
-- Replace this content with real docs when ready.
-- Keep the `.nav.yml` in the same folder to control the subsection navigation.
+- Edit overlaps with test1 to guarantee a conflict.
+- Update navigation under `learn/.nav.yml` accordingly when reconciling.
