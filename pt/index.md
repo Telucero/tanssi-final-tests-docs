@@ -1,6 +1,6 @@
 ---
-title: Início
-description: Bem-vindo ao site de documentação da rede Tanssi, o seu portal para uma implantação descentralizada rápida, eficiente e sem esforço.
+title: Home
+description: Bem-vindo ao site de documentação da Tanssi Network. Seu ponto de partida para implantar redes descentralizadas de forma rápida, eficiente e sem esforço.
 template: home.html
 hide:
 - footer

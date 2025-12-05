@@ -1,6 +1,6 @@
-title: Nó de rede com Tanssi
+title: Nó de rede alimentado por Tanssi
 hide: false
 nav:
   - index.md
-  - 'Usando Docker': rpc-docker.md
-  - 'Usando systemd': rpc-systemd.md
+  - 'Usando Docker': 'rpc-docker.md'
+  - 'Usando Systemd': 'rpc-systemd.md'

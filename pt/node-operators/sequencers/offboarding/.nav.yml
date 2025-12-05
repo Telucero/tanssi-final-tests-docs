@@ -1,5 +1,5 @@
-title: Desligamento
+title: Offboarding
 hide: false
 nav:
   - index.md
-  - 'Encerrar sua conta': account.md
+  - 'Desative Sua Conta': 'account.md'

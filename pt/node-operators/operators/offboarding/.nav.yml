@@ -1,7 +1,7 @@
-title: Desligamento
+title: Offboarding
 hide: false
 nav:
   - index.md
-  - 'Pré-requisitos': prerequisites.md
-  - 'Sair do Tanssi': opt-out-from-tanssi.md
-  - 'Sair do cofre': vault-opt-out.md
+  - 'Pré-requisitos': 'prerequisites.md'
+  - 'Optar por sair do Tanssi': 'opt-out-from-tanssi.md'
+  - 'Optar por sair do Cofre': 'vault-opt-out.md'
