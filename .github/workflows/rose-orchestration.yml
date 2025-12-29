@@ -23,13 +23,1551 @@ on:
         description: 'Separated list of files to translate (repo-relative paths)'
         required: false
         default: ''
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - edited
+      - closed
+  push:
+    branches:
+      - main
+      - master
+  schedule:
+    # Adjust time as needed (UTC).
+    - cron: '0 20 * * *'
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
+
+env:
+  # Repo variable name that stores translation languages (matches existing ROSE_LANGUAGES).
+  ROSE_LANGS_VAR_NAME: ROSE_LANGUAGES
 
 jobs:
+  label-sync:
+    name: Sync Rose Labels
+    if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: write
+    steps:
+      # Commit message commands: +rose / -rose and +rose:pt / -rose:pt anywhere in the message.
+      # Latest commit = last commit in the PR list that contains a command (API list order).
+      # UI label changes override older commit commands until a newer commit command is added.
+      - name: Sync labels from commit commands
+        uses: actions/github-script@v7
+        env:
+          ROSE_LANGS_VAR_NAME: ${{ env.ROSE_LANGS_VAR_NAME }}
+          ROSE_LANGS_RAW: ${{ vars[env.ROSE_LANGS_VAR_NAME] }}
+        with:
+          script: |
+            const varName = process.env.ROSE_LANGS_VAR_NAME || 'LANGUAGES';
+            const rawLangs = process.env.ROSE_LANGS_RAW || '';
+
+            const parseLanguages = (value) => {
+              const trimmed = String(value || '').trim();
+              if (!trimmed) {
+                throw new Error(
+                  `Repository variable "${varName}" is required but not set (e.g., "pt es fr" or ["pt","es","fr"]).`
+                );
+              }
+              if (trimmed.startsWith('[')) {
+                const parsed = JSON.parse(trimmed);
+                if (!Array.isArray(parsed)) {
+                  throw new Error(`Repository variable "${varName}" must be a JSON array string.`);
+                }
+                return parsed.map((item) => String(item).trim()).filter(Boolean);
+              }
+              return trimmed.split(/[,\s]+/).map((item) => item.trim()).filter(Boolean);
+            };
+
+            const languages = parseLanguages(rawLangs);
+            const langSet = new Set(languages.map((lang) => lang.toLowerCase()));
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              throw new Error('No pull request context available for label sync.');
+            }
+
+            const allowedLabel = (label) => {
+              if (label === 'rose' || label === 'rose-skip') {
+                return true;
+              }
+              if (label.startsWith('rose:')) {
+                return langSet.has(label.split(':')[1]);
+              }
+              if (label.startsWith('rose-skip:')) {
+                return langSet.has(label.split(':')[1]);
+              }
+              return false;
+            };
+
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const commandRegex = /[+-]rose(?:-skip)?(?::[a-zA-Z0-9._-]+)?/g;
+            const labelActions = new Map();
+
+            for (const commit of commits) {
+              const message = commit.commit?.message || '';
+              const commitDate = new Date(
+                commit.commit?.committer?.date || commit.commit?.author?.date || 0
+              ).getTime();
+              const matches = message.match(commandRegex);
+              if (!matches) {
+                continue;
+              }
+              for (const token of matches) {
+                const action = token.startsWith('+') ? 'add' : 'remove';
+                const label = token.slice(1).toLowerCase();
+                if (!allowedLabel(label)) {
+                  continue;
+                }
+                labelActions.set(label, { action, timestamp: commitDate });
+              }
+            }
+
+            if (labelActions.size === 0) {
+              core.info('No rose label commands found in commit messages.');
+              return;
+            }
+
+            const events = await github.paginate(github.rest.issues.listEvents, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              per_page: 100,
+            });
+
+            const labelEventTimes = new Map();
+            for (const event of events) {
+              if (event.event !== 'labeled' && event.event !== 'unlabeled') {
+                continue;
+              }
+              const labelName = event.label?.name?.toLowerCase();
+              if (!labelName || !allowedLabel(labelName)) {
+                continue;
+              }
+              const eventTime = new Date(event.created_at || 0).getTime();
+              const prevTime = labelEventTimes.get(labelName) || 0;
+              if (eventTime > prevTime) {
+                labelEventTimes.set(labelName, eventTime);
+              }
+            }
+
+            const currentLabels = (pr.labels || []).map((label) => label.name.toLowerCase());
+            const toAdd = [];
+            const toRemove = [];
+
+            for (const [label, data] of labelActions.entries()) {
+              const action = data.action;
+              const commandTime = data.timestamp || 0;
+              const labelEventTime = labelEventTimes.get(label) || 0;
+              if (labelEventTime > commandTime) {
+                core.info(
+                  `Skipping ${label} from commit commands; UI label change is newer.`
+                );
+                continue;
+              }
+              if (action === 'add' && !currentLabels.includes(label)) {
+                toAdd.push(label);
+              }
+              if (action === 'remove' && currentLabels.includes(label)) {
+                toRemove.push(label);
+              }
+            }
+
+            if (toAdd.length > 0) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels: toAdd,
+              });
+            }
+
+            for (const label of toRemove) {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                name: label,
+              });
+            }
+
+  queue-on-merge:
+    name: Queue Rose Translation
+    if: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      projects: write
+    env:
+      ROSE_PROJECT_OWNER: ${{ vars.ROSE_PROJECT_OWNER || github.repository_owner }}
+      ROSE_PROJECT_NUMBER: ${{ vars.ROSE_PROJECT_NUMBER || '' }}
+      ROSE_PROJECT_STATUS_FIELD: ${{ vars.ROSE_PROJECT_STATUS_FIELD || 'Status' }}
+      ROSE_PROJECT_STATUS_QUEUED: ${{ vars.ROSE_PROJECT_STATUS_QUEUED || 'Todo' }}
+      ROSE_PROJECT_LANG_FIELD: ${{ vars.ROSE_PROJECT_LANG_FIELD || 'Languages' }}
+      ROSE_PROJECT_BASE_SHA_FIELD: ${{ vars.ROSE_PROJECT_BASE_SHA_FIELD || 'Base SHA' }}
+      ROSE_PROJECT_MERGE_SHA_FIELD: ${{ vars.ROSE_PROJECT_MERGE_SHA_FIELD || 'Merge SHA' }}
+      ROSE_PROJECT_PR_NUMBER_FIELD: ${{ vars.ROSE_PROJECT_PR_NUMBER_FIELD || 'PR Number' }}
+      ROSE_PROJECT_ERROR_FIELD: ${{ vars.ROSE_PROJECT_ERROR_FIELD || 'Error' }}
+    steps:
+      # Language defaults: if no rose:{lang} labels exist, queue all configured languages (minus rose-skip:{lang}).
+      - name: Queue project item
+        uses: actions/github-script@v7
+        env:
+          ROSE_LANGS_VAR_NAME: ${{ env.ROSE_LANGS_VAR_NAME }}
+          ROSE_LANGS_RAW: ${{ vars[env.ROSE_LANGS_VAR_NAME] }}
+          ROSE_PROJECT_OWNER: ${{ env.ROSE_PROJECT_OWNER }}
+          ROSE_PROJECT_NUMBER: ${{ env.ROSE_PROJECT_NUMBER }}
+          ROSE_PROJECT_STATUS_FIELD: ${{ env.ROSE_PROJECT_STATUS_FIELD }}
+          ROSE_PROJECT_STATUS_QUEUED: ${{ env.ROSE_PROJECT_STATUS_QUEUED }}
+          ROSE_PROJECT_LANG_FIELD: ${{ env.ROSE_PROJECT_LANG_FIELD }}
+          ROSE_PROJECT_BASE_SHA_FIELD: ${{ env.ROSE_PROJECT_BASE_SHA_FIELD }}
+          ROSE_PROJECT_MERGE_SHA_FIELD: ${{ env.ROSE_PROJECT_MERGE_SHA_FIELD }}
+          ROSE_PROJECT_PR_NUMBER_FIELD: ${{ env.ROSE_PROJECT_PR_NUMBER_FIELD }}
+          ROSE_PROJECT_ERROR_FIELD: ${{ env.ROSE_PROJECT_ERROR_FIELD }}
+        with:
+          script: |
+            const varName = process.env.ROSE_LANGS_VAR_NAME || 'LANGUAGES';
+            const rawLangs = process.env.ROSE_LANGS_RAW || '';
+            const projectOwner = process.env.ROSE_PROJECT_OWNER || context.repo.owner;
+            const projectNumberRaw = process.env.ROSE_PROJECT_NUMBER || '';
+            const statusFieldName = process.env.ROSE_PROJECT_STATUS_FIELD || 'Status';
+            const statusQueuedName = process.env.ROSE_PROJECT_STATUS_QUEUED || 'Todo';
+            const langFieldName = process.env.ROSE_PROJECT_LANG_FIELD || 'Languages';
+            const baseFieldName = process.env.ROSE_PROJECT_BASE_SHA_FIELD || 'Base SHA';
+            const mergeFieldName = process.env.ROSE_PROJECT_MERGE_SHA_FIELD || 'Merge SHA';
+            const prNumberFieldName = process.env.ROSE_PROJECT_PR_NUMBER_FIELD || 'PR Number';
+            const errorFieldName = process.env.ROSE_PROJECT_ERROR_FIELD || 'Error';
+
+            const parseLanguages = (value) => {
+              const trimmed = String(value || '').trim();
+              if (!trimmed) {
+                throw new Error(
+                  `Repository variable "${varName}" is required but not set (e.g., "pt es fr" or ["pt","es","fr"]).`
+                );
+              }
+              if (trimmed.startsWith('[')) {
+                const parsed = JSON.parse(trimmed);
+                if (!Array.isArray(parsed)) {
+                  throw new Error(`Repository variable "${varName}" must be a JSON array string.`);
+                }
+                return parsed.map((item) => String(item).trim()).filter(Boolean);
+              }
+              return trimmed.split(/[,\s]+/).map((item) => item.trim()).filter(Boolean);
+            };
+
+            const languages = parseLanguages(rawLangs);
+            const langsLower = languages.map((lang) => lang.toLowerCase());
+            const langSet = new Set(langsLower);
+
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              throw new Error('No pull request context available for queue update.');
+            }
+
+            const labels = (pr.labels || []).map((label) => label.name.toLowerCase());
+            if (labels.includes('rose-skip')) {
+              core.info('rose-skip label present; skipping queue.');
+              return;
+            }
+            if (!labels.includes('rose')) {
+              core.info('rose label missing; skipping queue.');
+              return;
+            }
+
+            const optInSet = new Set(
+              labels
+                .filter((label) => label.startsWith('rose:'))
+                .map((label) => label.split(':')[1])
+                .filter((lang) => langSet.has(lang))
+            );
+            const skipSet = new Set(
+              labels
+                .filter((label) => label.startsWith('rose-skip:'))
+                .map((label) => label.split(':')[1])
+                .filter((lang) => langSet.has(lang))
+            );
+
+            let targetLangs = [];
+            if (optInSet.size > 0) {
+              targetLangs = langsLower.filter((lang) => optInSet.has(lang));
+            } else {
+              targetLangs = [...langsLower];
+            }
+            targetLangs = targetLangs.filter((lang) => !skipSet.has(lang));
+
+            if (targetLangs.length === 0) {
+              core.info('No languages to queue after applying skip labels.');
+              return;
+            }
+
+            const mergeSha = pr.merge_commit_sha;
+            if (!mergeSha) {
+              throw new Error('merge_commit_sha missing; cannot queue translation job.');
+            }
+            const baseSha = pr.base?.sha || '';
+
+            if (!projectNumberRaw.trim()) {
+              throw new Error('ROSE_PROJECT_NUMBER is required for project queue.');
+            }
+
+            const projectNumber = Number(projectNumberRaw);
+            if (!Number.isInteger(projectNumber)) {
+              throw new Error('ROSE_PROJECT_NUMBER must be an integer.');
+            }
+
+            const projectQuery = `
+              query($owner: String!, $number: Int!) {
+                organization(login: $owner) {
+                  projectV2(number: $number) {
+                    id
+                    title
+                    fields(first: 50) {
+                      nodes {
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options {
+                            id
+                            name
+                          }
+                        }
+                        ... on ProjectV2Field {
+                          id
+                          name
+                          dataType
+                        }
+                      }
+                    }
+                  }
+                }
+                user(login: $owner) {
+                  projectV2(number: $number) {
+                    id
+                    title
+                    fields(first: 50) {
+                      nodes {
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options {
+                            id
+                            name
+                          }
+                        }
+                        ... on ProjectV2Field {
+                          id
+                          name
+                          dataType
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            const data = await github.graphql(projectQuery, {
+              owner: projectOwner,
+              number: projectNumber,
+            });
+            const project = data.organization?.projectV2 || data.user?.projectV2;
+            if (!project) {
+              throw new Error(`Project #${projectNumber} not found for ${projectOwner}.`);
+            }
+
+            const fieldByName = (name) =>
+              project.fields.nodes.find((field) => field && field.name === name);
+
+            const statusField = fieldByName(statusFieldName);
+            if (!statusField || !statusField.options) {
+              throw new Error(`Status field "${statusFieldName}" not found in project.`);
+            }
+            const queuedOption = statusField.options.find(
+              (option) => option.name === statusQueuedName
+            );
+            if (!queuedOption) {
+              throw new Error(`Status option "${statusQueuedName}" not found in project.`);
+            }
+
+            const langField = fieldByName(langFieldName);
+            const baseField = fieldByName(baseFieldName);
+            const mergeField = fieldByName(mergeFieldName);
+            const prNumberField = fieldByName(prNumberFieldName);
+            const errorField = fieldByName(errorFieldName);
+
+            const contentId = pr.node_id;
+            if (!contentId) {
+              throw new Error('PR node_id missing; cannot queue translation job.');
+            }
+
+            const addItemMutation = `
+              mutation($projectId: ID!, $contentId: ID!) {
+                addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
+                  item {
+                    id
+                  }
+                }
+              }
+            `;
+
+            const findItemQuery = `
+              query($projectId: ID!, $after: String) {
+                node(id: $projectId) {
+                  ... on ProjectV2 {
+                    items(first: 100, after: $after) {
+                      nodes {
+                        id
+                        content {
+                          ... on PullRequest {
+                            id
+                          }
+                        }
+                      }
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            const ensureItemId = async () => {
+              try {
+                const addResult = await github.graphql(addItemMutation, {
+                  projectId: project.id,
+                  contentId,
+                });
+                return addResult.addProjectV2ItemById?.item?.id || null;
+              } catch (error) {
+                if (!String(error.message).includes('already exists')) {
+                  throw error;
+                }
+              }
+
+              let after = null;
+              while (true) {
+                const data = await github.graphql(findItemQuery, {
+                  projectId: project.id,
+                  after,
+                });
+                const items = data.node?.items?.nodes || [];
+                for (const item of items) {
+                  if (item?.content?.id === contentId) {
+                    return item.id;
+                  }
+                }
+                const pageInfo = data.node?.items?.pageInfo;
+                if (!pageInfo?.hasNextPage) {
+                  break;
+                }
+                after = pageInfo.endCursor;
+              }
+              return null;
+            };
+
+            const itemId = await ensureItemId();
+            if (!itemId) {
+              throw new Error('Project item not found; cannot update queue status.');
+            }
+
+            const updateStatusMutation = `
+              mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                updateProjectV2ItemFieldValue(
+                  input: {
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { singleSelectOptionId: $optionId }
+                  }
+                ) {
+                  projectV2Item {
+                    id
+                  }
+                }
+              }
+            `;
+
+            const updateTextMutation = `
+              mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $text: String!) {
+                updateProjectV2ItemFieldValue(
+                  input: {
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { text: $text }
+                  }
+                ) {
+                  projectV2Item {
+                    id
+                  }
+                }
+              }
+            `;
+
+            await github.graphql(updateStatusMutation, {
+              projectId: project.id,
+              itemId,
+              fieldId: statusField.id,
+              optionId: queuedOption.id,
+            });
+
+            const updateTextField = async (field, value) => {
+              if (!field) {
+                return;
+              }
+              await github.graphql(updateTextMutation, {
+                projectId: project.id,
+                itemId,
+                fieldId: field.id,
+                text: value || '',
+              });
+            };
+
+            await updateTextField(langField, targetLangs.join(', '));
+            await updateTextField(baseField, baseSha);
+            await updateTextField(mergeField, mergeSha);
+            await updateTextField(prNumberField, String(pr.number));
+            await updateTextField(errorField, '');
+
+  process-queue:
+    name: Process Rose Queue
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      projects: write
+    env:
+      N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL_TR }}
+      ROSE_N8N_SENDING_TOKEN: ${{ secrets.N8N_SENDING_TOKEN || '' }}
+      ROSE_N8N_RECEIVING_TOKEN: ${{ secrets.N8N_RECEIVING_TOKEN || '' }}
+      ROSE_N8N_ALLOWED_HOST: ${{ vars.N8N_ALLOWED_HOST || '' }}
+      ROSE_QUIET: "1"
+      ROSE_LANGUAGES: ${{ vars.ROSE_LANGUAGES }}
+      ROSE_TRANSLATION_BRANCH: rose/translations
+      ROSE_PROJECT_OWNER: ${{ vars.ROSE_PROJECT_OWNER || github.repository_owner }}
+      ROSE_PROJECT_NUMBER: ${{ vars.ROSE_PROJECT_NUMBER || '' }}
+      ROSE_PROJECT_STATUS_FIELD: ${{ vars.ROSE_PROJECT_STATUS_FIELD || 'Status' }}
+      ROSE_PROJECT_STATUS_QUEUED: ${{ vars.ROSE_PROJECT_STATUS_QUEUED || 'Todo' }}
+      ROSE_PROJECT_STATUS_IN_PROGRESS: ${{ vars.ROSE_PROJECT_STATUS_IN_PROGRESS || 'In Progress' }}
+      ROSE_PROJECT_STATUS_DONE: ${{ vars.ROSE_PROJECT_STATUS_DONE || 'Done' }}
+      ROSE_PROJECT_STATUS_FAILED: ${{ vars.ROSE_PROJECT_STATUS_FAILED || 'Failed' }}
+      ROSE_PROJECT_LANG_FIELD: ${{ vars.ROSE_PROJECT_LANG_FIELD || 'Languages' }}
+      ROSE_PROJECT_BASE_SHA_FIELD: ${{ vars.ROSE_PROJECT_BASE_SHA_FIELD || 'Base SHA' }}
+      ROSE_PROJECT_MERGE_SHA_FIELD: ${{ vars.ROSE_PROJECT_MERGE_SHA_FIELD || 'Merge SHA' }}
+      ROSE_PROJECT_ERROR_FIELD: ${{ vars.ROSE_PROJECT_ERROR_FIELD || 'Error' }}
+      ROSE_PROJECT_RUN_URL_FIELD: ${{ vars.ROSE_PROJECT_RUN_URL_FIELD || 'Summary URL' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install translation workflow dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyYAML ruamel.yaml Babel
+
+      - name: Preflight project schema
+        uses: actions/github-script@v7
+        env:
+          ROSE_PROJECT_OWNER: ${{ env.ROSE_PROJECT_OWNER }}
+          ROSE_PROJECT_NUMBER: ${{ env.ROSE_PROJECT_NUMBER }}
+          ROSE_PROJECT_STATUS_FIELD: ${{ env.ROSE_PROJECT_STATUS_FIELD }}
+          ROSE_PROJECT_STATUS_QUEUED: ${{ env.ROSE_PROJECT_STATUS_QUEUED }}
+          ROSE_PROJECT_STATUS_IN_PROGRESS: ${{ env.ROSE_PROJECT_STATUS_IN_PROGRESS }}
+          ROSE_PROJECT_STATUS_DONE: ${{ env.ROSE_PROJECT_STATUS_DONE }}
+          ROSE_PROJECT_STATUS_FAILED: ${{ env.ROSE_PROJECT_STATUS_FAILED }}
+          ROSE_PROJECT_LANG_FIELD: ${{ env.ROSE_PROJECT_LANG_FIELD }}
+          ROSE_PROJECT_BASE_SHA_FIELD: ${{ env.ROSE_PROJECT_BASE_SHA_FIELD }}
+          ROSE_PROJECT_MERGE_SHA_FIELD: ${{ env.ROSE_PROJECT_MERGE_SHA_FIELD }}
+          ROSE_PROJECT_ERROR_FIELD: ${{ env.ROSE_PROJECT_ERROR_FIELD }}
+          ROSE_PROJECT_RUN_URL_FIELD: ${{ env.ROSE_PROJECT_RUN_URL_FIELD }}
+        with:
+          script: |
+            const projectOwner = process.env.ROSE_PROJECT_OWNER || context.repo.owner;
+            const projectNumberRaw = process.env.ROSE_PROJECT_NUMBER || '';
+            const statusFieldName = process.env.ROSE_PROJECT_STATUS_FIELD || 'Status';
+            const statusQueuedName = process.env.ROSE_PROJECT_STATUS_QUEUED || 'Todo';
+            const statusInProgressName =
+              process.env.ROSE_PROJECT_STATUS_IN_PROGRESS || 'In Progress';
+            const statusDoneName = process.env.ROSE_PROJECT_STATUS_DONE || 'Done';
+            const statusFailedName = process.env.ROSE_PROJECT_STATUS_FAILED || 'Failed';
+            const langFieldName = process.env.ROSE_PROJECT_LANG_FIELD || 'Languages';
+            const baseFieldName = process.env.ROSE_PROJECT_BASE_SHA_FIELD || 'Base SHA';
+            const mergeFieldName = process.env.ROSE_PROJECT_MERGE_SHA_FIELD || 'Merge SHA';
+            const errorFieldName = process.env.ROSE_PROJECT_ERROR_FIELD || 'Error';
+            const runUrlFieldName = process.env.ROSE_PROJECT_RUN_URL_FIELD || 'Summary URL';
+
+            if (!projectNumberRaw.trim()) {
+              throw new Error('ROSE_PROJECT_NUMBER is required for project queue.');
+            }
+            const projectNumber = Number(projectNumberRaw);
+            if (!Number.isInteger(projectNumber)) {
+              throw new Error('ROSE_PROJECT_NUMBER must be an integer.');
+            }
+
+            const projectQuery = `
+              query($owner: String!, $number: Int!, $after: String) {
+                organization(login: $owner) {
+                  projectV2(number: $number) {
+                    id
+                    title
+                    fields(first: 100, after: $after) {
+                      nodes {
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options {
+                            id
+                            name
+                          }
+                        }
+                        ... on ProjectV2Field {
+                          id
+                          name
+                          dataType
+                        }
+                      }
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                    }
+                  }
+                }
+                user(login: $owner) {
+                  projectV2(number: $number) {
+                    id
+                    title
+                    fields(first: 100, after: $after) {
+                      nodes {
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options {
+                            id
+                            name
+                          }
+                        }
+                        ... on ProjectV2Field {
+                          id
+                          name
+                          dataType
+                        }
+                      }
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            let project;
+            let fields = [];
+            let after = null;
+            while (true) {
+              const data = await github.graphql(projectQuery, {
+                owner: projectOwner,
+                number: projectNumber,
+                after,
+              });
+              project = data.organization?.projectV2 || data.user?.projectV2;
+              if (!project) {
+                throw new Error(`Project #${projectNumber} not found for ${projectOwner}.`);
+              }
+              fields = fields.concat(project.fields.nodes || []);
+              const pageInfo = project.fields.pageInfo;
+              if (!pageInfo?.hasNextPage) {
+                break;
+              }
+              after = pageInfo.endCursor;
+            }
+            const fieldByName = (name) => fields.find((field) => field && field.name === name);
+            const statusField = fieldByName(statusFieldName);
+            if (!statusField || !statusField.options) {
+              throw new Error(`Status field "${statusFieldName}" not found in project.`);
+            }
+
+            const requiredStatusOptions = [
+              statusQueuedName,
+              statusInProgressName,
+              statusDoneName,
+              statusFailedName,
+            ];
+            const missingOptions = requiredStatusOptions.filter(
+              (option) => !statusField.options.find((item) => item.name === option)
+            );
+            if (missingOptions.length) {
+              throw new Error(
+                `Missing Status options: ${missingOptions.join(', ')} (field "${statusFieldName}").`
+              );
+            }
+
+            const requiredTextFields = [
+              langFieldName,
+              baseFieldName,
+              mergeFieldName,
+              errorFieldName,
+              runUrlFieldName,
+            ];
+            const missingFields = requiredTextFields.filter((name) => !fieldByName(name));
+            if (missingFields.length) {
+              throw new Error(`Missing Project fields: ${missingFields.join(', ')}.`);
+            }
+
+      - name: Select queued entries
+        id: queue_entries
+        uses: actions/github-script@v7
+        env:
+          ROSE_PROJECT_OWNER: ${{ env.ROSE_PROJECT_OWNER }}
+          ROSE_PROJECT_NUMBER: ${{ env.ROSE_PROJECT_NUMBER }}
+          ROSE_PROJECT_STATUS_FIELD: ${{ env.ROSE_PROJECT_STATUS_FIELD }}
+          ROSE_PROJECT_STATUS_QUEUED: ${{ env.ROSE_PROJECT_STATUS_QUEUED }}
+          ROSE_PROJECT_STATUS_IN_PROGRESS: ${{ env.ROSE_PROJECT_STATUS_IN_PROGRESS }}
+          ROSE_PROJECT_LANG_FIELD: ${{ env.ROSE_PROJECT_LANG_FIELD }}
+          ROSE_PROJECT_BASE_SHA_FIELD: ${{ env.ROSE_PROJECT_BASE_SHA_FIELD }}
+          ROSE_PROJECT_MERGE_SHA_FIELD: ${{ env.ROSE_PROJECT_MERGE_SHA_FIELD }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const projectOwner = process.env.ROSE_PROJECT_OWNER || context.repo.owner;
+            const projectNumberRaw = process.env.ROSE_PROJECT_NUMBER || '';
+            const statusFieldName = process.env.ROSE_PROJECT_STATUS_FIELD || 'Status';
+            const statusQueuedName = process.env.ROSE_PROJECT_STATUS_QUEUED || 'Todo';
+            const statusInProgressName =
+              process.env.ROSE_PROJECT_STATUS_IN_PROGRESS || 'In Progress';
+            const langFieldName = process.env.ROSE_PROJECT_LANG_FIELD || 'Languages';
+            const baseFieldName = process.env.ROSE_PROJECT_BASE_SHA_FIELD || 'Base SHA';
+            const mergeFieldName = process.env.ROSE_PROJECT_MERGE_SHA_FIELD || 'Merge SHA';
+
+            if (!projectNumberRaw.trim()) {
+              throw new Error('ROSE_PROJECT_NUMBER is required for project queue.');
+            }
+            const projectNumber = Number(projectNumberRaw);
+            if (!Number.isInteger(projectNumber)) {
+              throw new Error('ROSE_PROJECT_NUMBER must be an integer.');
+            }
+
+            const projectQuery = `
+              query($owner: String!, $number: Int!) {
+                organization(login: $owner) {
+                  projectV2(number: $number) {
+                    id
+                    fields(first: 50) {
+                      nodes {
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options {
+                            id
+                            name
+                          }
+                        }
+                        ... on ProjectV2Field {
+                          id
+                          name
+                          dataType
+                        }
+                      }
+                    }
+                  }
+                }
+                user(login: $owner) {
+                  projectV2(number: $number) {
+                    id
+                    fields(first: 50) {
+                      nodes {
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options {
+                            id
+                            name
+                          }
+                        }
+                        ... on ProjectV2Field {
+                          id
+                          name
+                          dataType
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            const data = await github.graphql(projectQuery, {
+              owner: projectOwner,
+              number: projectNumber,
+            });
+            const project = data.organization?.projectV2 || data.user?.projectV2;
+            if (!project) {
+              throw new Error(`Project #${projectNumber} not found for ${projectOwner}.`);
+            }
+
+            const itemsQuery = `
+              query($projectId: ID!, $after: String) {
+                node(id: $projectId) {
+                  ... on ProjectV2 {
+                    items(first: 50, after: $after) {
+                      nodes {
+                        id
+                        content {
+                          ... on PullRequest {
+                            number
+                          }
+                        }
+                        fieldValues(first: 50) {
+                          nodes {
+                            ... on ProjectV2ItemFieldSingleSelectValue {
+                              field {
+                                ... on ProjectV2SingleSelectField {
+                                  name
+                                }
+                              }
+                              name
+                            }
+                            ... on ProjectV2ItemFieldTextValue {
+                              field {
+                                ... on ProjectV2Field {
+                                  name
+                                }
+                              }
+                              text
+                            }
+                          }
+                        }
+                      }
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            const queuedEntries = [];
+            let after = null;
+            while (true) {
+              const page = await github.graphql(itemsQuery, {
+                projectId: project.id,
+                after,
+              });
+              const items = page.node?.items?.nodes || [];
+              for (const item of items) {
+                const prNumber = item.content?.number;
+                if (!prNumber) {
+                  continue;
+                }
+                const fieldValues = {};
+                for (const value of item.fieldValues.nodes || []) {
+                  const fieldName = value.field?.name;
+                  if (!fieldName) {
+                    continue;
+                  }
+                  if (typeof value.text === 'string') {
+                    fieldValues[fieldName] = value.text;
+                  } else if (typeof value.name === 'string') {
+                    fieldValues[fieldName] = value.name;
+                  }
+                }
+                const status = fieldValues[statusFieldName];
+                if (status !== statusQueuedName) {
+                  continue;
+                }
+                const rawLanguages = fieldValues[langFieldName] || '';
+                const languages = rawLanguages
+                  .split(/[,\\s]+/)
+                  .map((lang) => lang.trim())
+                  .filter(Boolean);
+                queuedEntries.push({
+                  item_id: item.id,
+                  pr_number: prNumber,
+                  base_sha: fieldValues[baseFieldName] || '',
+                  merge_sha: fieldValues[mergeFieldName] || '',
+                  languages,
+                });
+              }
+              const pageInfo = page.node?.items?.pageInfo;
+              if (!pageInfo?.hasNextPage) {
+                break;
+              }
+              after = pageInfo.endCursor;
+            }
+
+            if (!queuedEntries.length) {
+              core.info('No queued entries found.');
+              core.setOutput('count', '0');
+              return;
+            }
+
+            const outPath = path.join(process.env.RUNNER_TEMP || '.', 'rose_queue_entries.json');
+            fs.writeFileSync(outPath, JSON.stringify(queuedEntries, null, 2));
+            core.setOutput('queue_file', outPath);
+            core.setOutput('count', String(queuedEntries.length));
+
+      - name: Mark queued items as in progress
+        if: ${{ steps.queue_entries.outputs.count != '0' }}
+        uses: actions/github-script@v7
+        env:
+          QUEUE_FILE: ${{ steps.queue_entries.outputs.queue_file }}
+          ROSE_PROJECT_OWNER: ${{ env.ROSE_PROJECT_OWNER }}
+          ROSE_PROJECT_NUMBER: ${{ env.ROSE_PROJECT_NUMBER }}
+          ROSE_PROJECT_STATUS_FIELD: ${{ env.ROSE_PROJECT_STATUS_FIELD }}
+          ROSE_PROJECT_STATUS_IN_PROGRESS: ${{ env.ROSE_PROJECT_STATUS_IN_PROGRESS }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            const queueFile = process.env.QUEUE_FILE;
+            if (!queueFile || !fs.existsSync(queueFile)) {
+              core.info('Queue file missing; skipping in-progress update.');
+              return;
+            }
+
+            const entries = JSON.parse(fs.readFileSync(queueFile, 'utf8'));
+            if (!entries.length) {
+              core.info('No queued entries found.');
+              return;
+            }
+
+            const projectOwner = process.env.ROSE_PROJECT_OWNER || context.repo.owner;
+            const projectNumberRaw = process.env.ROSE_PROJECT_NUMBER || '';
+            const statusFieldName = process.env.ROSE_PROJECT_STATUS_FIELD || 'Status';
+            const statusInProgressName =
+              process.env.ROSE_PROJECT_STATUS_IN_PROGRESS || 'In Progress';
+
+            if (!projectNumberRaw.trim()) {
+              throw new Error('ROSE_PROJECT_NUMBER is required for project queue.');
+            }
+            const projectNumber = Number(projectNumberRaw);
+            if (!Number.isInteger(projectNumber)) {
+              throw new Error('ROSE_PROJECT_NUMBER must be an integer.');
+            }
+
+            const projectQuery = `
+              query($owner: String!, $number: Int!) {
+                organization(login: $owner) {
+                  projectV2(number: $number) {
+                    id
+                    fields(first: 50) {
+                      nodes {
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options {
+                            id
+                            name
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+                user(login: $owner) {
+                  projectV2(number: $number) {
+                    id
+                    fields(first: 50) {
+                      nodes {
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options {
+                            id
+                            name
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            const data = await github.graphql(projectQuery, {
+              owner: projectOwner,
+              number: projectNumber,
+            });
+            const project = data.organization?.projectV2 || data.user?.projectV2;
+            if (!project) {
+              throw new Error(`Project #${projectNumber} not found for ${projectOwner}.`);
+            }
+
+            const statusField = project.fields.nodes.find(
+              (field) => field && field.name === statusFieldName
+            );
+            if (!statusField || !statusField.options) {
+              throw new Error(`Status field "${statusFieldName}" not found in project.`);
+            }
+            const inProgressOption = statusField.options.find(
+              (option) => option.name === statusInProgressName
+            );
+            if (!inProgressOption) {
+              throw new Error(`Status option "${statusInProgressName}" not found in project.`);
+            }
+
+            const updateStatusMutation = `
+              mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                updateProjectV2ItemFieldValue(
+                  input: {
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { singleSelectOptionId: $optionId }
+                  }
+                ) {
+                  projectV2Item {
+                    id
+                  }
+                }
+              }
+            `;
+
+            for (const entry of entries) {
+              if (!entry.item_id) {
+                continue;
+              }
+              await github.graphql(updateStatusMutation, {
+                projectId: project.id,
+                itemId: entry.item_id,
+                fieldId: statusField.id,
+                optionId: inProgressOption.id,
+              });
+            }
+
+      - name: Run Rose pipeline from queue
+        if: ${{ steps.queue_entries.outputs.count != '0' }}
+        id: process_queue
+        shell: bash
+        env:
+          QUEUE_FILE: ${{ steps.queue_entries.outputs.queue_file }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${N8N_WEBHOOK_URL:-}" ]]; then
+            echo "N8N_WEBHOOK_URL_TR secret is required" >&2
+            exit 1
+          fi
+
+          SUCCESS_FILE="${RUNNER_TEMP}/rose_queue_success.json"
+          FAILED_FILE="${RUNNER_TEMP}/rose_queue_failed.json"
+          export SUCCESS_FILE FAILED_FILE
+
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import traceback
+
+          queue_file = os.environ.get("QUEUE_FILE")
+          success_file = os.environ.get("SUCCESS_FILE")
+          failed_file = os.environ.get("FAILED_FILE")
+          output_path = os.environ.get("GITHUB_OUTPUT")
+
+          if not queue_file or not os.path.exists(queue_file):
+              raise SystemExit("Queue file missing; aborting.")
+
+          with open(queue_file, "r", encoding="utf-8") as handle:
+              entries = json.load(handle)
+
+          if not entries:
+              print("No queued entries to process.")
+              entries = []
+
+          successes = []
+          failures = []
+
+          for entry in entries:
+              pr_number = entry.get("pr_number")
+              base_sha = entry.get("base_sha")
+              merge_sha = entry.get("merge_sha")
+              languages = entry.get("languages") or []
+              if not merge_sha or not languages:
+                  reason = "missing merge SHA or languages"
+                  failures.append({**entry, "error": reason})
+                  print(f"Skipping entry for PR {pr_number}: {reason}.")
+                  continue
+              if not base_sha or base_sha == "unknown":
+                  base_sha = subprocess.check_output(
+                      ["git", "rev-parse", f"{merge_sha}^1"], text=True
+                  ).strip()
+
+              diff_files = subprocess.check_output(
+                  ["git", "diff", "--name-only", base_sha, merge_sha], text=True
+              ).splitlines()
+
+              langs_lower = [lang.lower() for lang in languages]
+
+              def should_include(path: str) -> bool:
+                  path_lower = path.lower()
+                  if path_lower.endswith(".md"):
+                      return True
+                  if path_lower == ".nav.yml" or path_lower.endswith("/.nav.yml"):
+                      return True
+                  if path_lower.startswith(".snippets/text/") and path_lower.endswith(".json"):
+                      return True
+                  return False
+
+              def is_excluded(path: str) -> bool:
+                  path_lower = path.lower()
+                  excluded_prefixes = [".github/", "node_modules/", "dist/", "site/"]
+                  if any(path_lower.startswith(prefix) for prefix in excluded_prefixes):
+                      return True
+                  for lang in langs_lower:
+                      if path_lower.startswith(f"{lang}/"):
+                          return True
+                      if path_lower.startswith(f"text/{lang}/"):
+                          return True
+                      if path_lower.startswith(f".snippets/text/{lang}/"):
+                          return True
+                  return False
+
+              include_files = [
+                  path for path in diff_files if should_include(path) and not is_excluded(path)
+              ]
+
+              if not include_files:
+                  reason = "no eligible files to translate"
+                  failures.append({**entry, "error": reason})
+                  print(f"Skipping PR #{pr_number}: {reason}.")
+                  continue
+
+              env = os.environ.copy()
+              env["ROSE_PRESERVE_TRANSLATIONS"] = "1"
+              env["ROSE_INCLUDE_FILES"] = "\n".join(include_files)
+
+              cmd = [
+                  "python",
+                  "scripts/translation-workflow/rose_pipeline.py",
+                  "--base",
+                  base_sha,
+                  "--head",
+                  merge_sha,
+                  "--n8n-webhook",
+                  env["N8N_WEBHOOK_URL"],
+                  "--languages",
+              ] + languages
+
+              print(f"Processing PR #{pr_number} ({', '.join(languages)})")
+              try:
+                  subprocess.run(cmd, check=True, env=env)
+                  successes.append(entry)
+              except subprocess.CalledProcessError as exc:
+                  reason = f"pipeline failed (exit {exc.returncode})"
+                  failures.append({**entry, "error": reason})
+                  print(f"PR #{pr_number} failed: {reason}")
+              except Exception as exc:
+                  reason = f"unexpected error: {exc}"
+                  failures.append({**entry, "error": reason})
+                  print(f"PR #{pr_number} failed: {reason}")
+                  traceback.print_exc()
+
+          if success_file:
+              with open(success_file, "w", encoding="utf-8") as handle:
+                  json.dump(successes, handle, indent=2)
+          if failed_file:
+              with open(failed_file, "w", encoding="utf-8") as handle:
+                  json.dump(failures, handle, indent=2)
+
+          if output_path:
+              with open(output_path, "a", encoding="utf-8") as handle:
+                  handle.write(f"success_file={success_file}\n")
+                  handle.write(f"failed_file={failed_file}\n")
+                  handle.write(f"success_count={len(successes)}\n")
+                  handle.write(f"failed_count={len(failures)}\n")
+          PY
+
+      - name: Prepare temporary summary directory
+        if: ${{ steps.process_queue.outputs.success_count != '0' }}
+        id: temp_summary
+        run: |
+          TMP_DIR=$(mktemp -d)
+          echo "dir=$TMP_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Generate summary markdown
+        if: ${{ steps.process_queue.outputs.success_count != '0' }}
+        shell: bash
+        run: |
+          SUMMARY_JSON="scripts/translations/summary_report.json"
+          SUMMARY_MD="${{ steps.temp_summary.outputs.dir }}/summary.md"
+          if [[ ! -f "$SUMMARY_JSON" ]]; then
+            echo '{}' > "$SUMMARY_JSON"
+          fi
+          python scripts/translation-workflow/render_summary.py \
+            --summary "$SUMMARY_JSON" \
+            --output "$SUMMARY_MD"
+
+      - name: Append translation summary to job summary
+        if: ${{ steps.process_queue.outputs.success_count != '0' }}
+        shell: bash
+        run: |
+          SUMMARY_MD="${{ steps.temp_summary.outputs.dir }}/summary.md"
+          if [[ -f "$SUMMARY_MD" ]]; then
+            cat "$SUMMARY_MD" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Summary markdown not found; skipping job summary update."
+          fi
+
+      - name: Cleanup translation artifacts
+        if: ${{ steps.process_queue.outputs.success_count != '0' }}
+        run: rm -rf scripts/translations
+
+      - name: Push translation branch
+        if: ${{ steps.process_queue.outputs.success_count != '0' }}
+        id: push_branch
+        shell: bash
+        env:
+          TRANSLATION_BRANCH: ${{ env.ROSE_TRANSLATION_BRANCH }}
+        run: |
+          set -euo pipefail
+          restore_commit="$(git rev-parse HEAD)"
+          restore_branch="$(git symbolic-ref --quiet --short HEAD || true)"
+          changes="$(git status --porcelain)"
+          echo "branch=${TRANSLATION_BRANCH}" >> "$GITHUB_OUTPUT"
+          if [[ -z "$changes" ]]; then
+            echo "No translation changes detected; skipping branch push."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin "$TRANSLATION_BRANCH":"refs/remotes/origin/$TRANSLATION_BRANCH" || true
+          git branch -D "$TRANSLATION_BRANCH" 2>/dev/null || true
+          git checkout -B "$TRANSLATION_BRANCH"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No staged changes to commit; skipping branch push."
+            if [[ -n "$restore_branch" ]]; then
+              git checkout "$restore_branch"
+            else
+              git checkout --detach "$restore_commit"
+            fi
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m "chore(rose): sync translations from queue"
+          if git show-ref --verify --quiet "refs/remotes/origin/$TRANSLATION_BRANCH"; then
+            git merge --no-edit -X ours "refs/remotes/origin/$TRANSLATION_BRANCH"
+          else
+            echo "No existing remote branch $TRANSLATION_BRANCH; starting fresh."
+          fi
+          git push --force-with-lease origin "$TRANSLATION_BRANCH"
+          if [[ -n "$restore_branch" ]]; then
+            git checkout "$restore_branch"
+          else
+            git checkout --detach "$restore_commit"
+          fi
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Update queue entries status
+        if: ${{ always() && steps.queue_entries.outputs.count != '0' }}
+        uses: actions/github-script@v7
+        env:
+          QUEUE_SUCCESS_FILE: ${{ steps.process_queue.outputs.success_file }}
+          QUEUE_FAILED_FILE: ${{ steps.process_queue.outputs.failed_file }}
+          QUEUE_FILE: ${{ steps.queue_entries.outputs.queue_file }}
+          PROCESS_QUEUE_OUTCOME: ${{ steps.process_queue.outcome }}
+          ROSE_PROJECT_OWNER: ${{ env.ROSE_PROJECT_OWNER }}
+          ROSE_PROJECT_NUMBER: ${{ env.ROSE_PROJECT_NUMBER }}
+          ROSE_PROJECT_STATUS_FIELD: ${{ env.ROSE_PROJECT_STATUS_FIELD }}
+          ROSE_PROJECT_STATUS_DONE: ${{ env.ROSE_PROJECT_STATUS_DONE }}
+          ROSE_PROJECT_STATUS_FAILED: ${{ env.ROSE_PROJECT_STATUS_FAILED || 'Failed' }}
+          ROSE_PROJECT_ERROR_FIELD: ${{ env.ROSE_PROJECT_ERROR_FIELD || 'Error' }}
+          ROSE_PROJECT_RUN_URL_FIELD: ${{ env.ROSE_PROJECT_RUN_URL_FIELD || 'Summary URL' }}
+          ROSE_RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            const successFile = process.env.QUEUE_SUCCESS_FILE;
+            const failedFile = process.env.QUEUE_FAILED_FILE;
+            const queueFile = process.env.QUEUE_FILE;
+            const processOutcome = process.env.PROCESS_QUEUE_OUTCOME || 'unknown';
+            const successEntries = successFile && fs.existsSync(successFile)
+              ? JSON.parse(fs.readFileSync(successFile, 'utf8'))
+              : [];
+            let failedEntries = failedFile && fs.existsSync(failedFile)
+              ? JSON.parse(fs.readFileSync(failedFile, 'utf8'))
+              : [];
+            if (!successEntries.length && !failedEntries.length && queueFile && fs.existsSync(queueFile)) {
+              const queuedEntries = JSON.parse(fs.readFileSync(queueFile, 'utf8'));
+              if (queuedEntries.length && processOutcome !== 'success') {
+                failedEntries = queuedEntries.map((entry) => ({
+                  ...entry,
+                  error: `queue processing failed before completion (${processOutcome})`,
+                }));
+                core.warning('Queue processing failed before producing results; marking entries failed.');
+              }
+            }
+            if (!successEntries.length && !failedEntries.length) {
+              core.info('No queue entries to update.');
+              return;
+            }
+
+            const projectOwner = process.env.ROSE_PROJECT_OWNER || context.repo.owner;
+            const projectNumberRaw = process.env.ROSE_PROJECT_NUMBER || '';
+            const statusFieldName = process.env.ROSE_PROJECT_STATUS_FIELD || 'Status';
+            const statusDoneName =
+              process.env.ROSE_PROJECT_STATUS_DONE || 'Done';
+            const statusFailedName =
+              process.env.ROSE_PROJECT_STATUS_FAILED || 'Failed';
+            const errorFieldName =
+              process.env.ROSE_PROJECT_ERROR_FIELD || 'Error';
+            const runUrlFieldName =
+              process.env.ROSE_PROJECT_RUN_URL_FIELD || 'Summary URL';
+            const runUrl = process.env.ROSE_RUN_URL || '';
+
+            if (!projectNumberRaw.trim()) {
+              core.info('ROSE_PROJECT_NUMBER not set; skipping project sync.');
+              return;
+            }
+
+            const projectNumber = Number(projectNumberRaw);
+            if (!Number.isInteger(projectNumber)) {
+              core.warning('ROSE_PROJECT_NUMBER must be an integer; skipping project sync.');
+              return;
+            }
+
+            const projectQuery = `
+              query($owner: String!, $number: Int!) {
+                organization(login: $owner) {
+                  projectV2(number: $number) {
+                    id
+                    title
+                    fields(first: 50) {
+                      nodes {
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options {
+                            id
+                            name
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+                user(login: $owner) {
+                  projectV2(number: $number) {
+                    id
+                    title
+                    fields(first: 50) {
+                      nodes {
+                        ... on ProjectV2SingleSelectField {
+                          id
+                          name
+                          options {
+                            id
+                            name
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            let project;
+            try {
+              const data = await github.graphql(projectQuery, {
+                owner: projectOwner,
+                number: projectNumber,
+              });
+              project = data.organization?.projectV2 || data.user?.projectV2;
+            } catch (error) {
+              core.warning(`Failed to load project: ${error.message}`);
+              return;
+            }
+
+            if (!project) {
+              core.warning(`Project #${projectNumber} not found for ${projectOwner}; skipping project sync.`);
+              return;
+            }
+
+            const fieldByName = (name) =>
+              project.fields.nodes.find((field) => field && field.name === name);
+
+            const statusField = fieldByName(statusFieldName);
+            if (!statusField || !statusField.options) {
+              core.warning(`Status field "${statusFieldName}" not found in project; skipping project sync.`);
+              return;
+            }
+            const doneOption = statusField.options.find(
+              (option) => option.name === statusDoneName
+            );
+            if (!doneOption) {
+              core.warning(`Status option "${statusDoneName}" not found; skipping done updates.`);
+            }
+            const failedOption = statusField.options.find(
+              (option) => option.name === statusFailedName
+            );
+            if (!failedOption && failedEntries.length) {
+              core.warning(`Status option "${statusFailedName}" not found; skipping failed updates.`);
+            }
+            const errorField = fieldByName(errorFieldName);
+            const runUrlField = fieldByName(runUrlFieldName);
+
+            const updateStatusMutation = `
+              mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                updateProjectV2ItemFieldValue(
+                  input: {
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { singleSelectOptionId: $optionId }
+                  }
+                ) {
+                  projectV2Item {
+                    id
+                  }
+                }
+              }
+            `;
+
+            const updateTextMutation = `
+              mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $text: String!) {
+                updateProjectV2ItemFieldValue(
+                  input: {
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { text: $text }
+                  }
+                ) {
+                  projectV2Item {
+                    id
+                  }
+                }
+              }
+            `;
+
+            const updateProjectStatus = async (entry, option, label, errorText) => {
+              const itemId = entry.item_id;
+              if (!itemId) {
+                core.warning('Project item id missing; skipping update.');
+                return;
+              }
+              if (option) {
+                try {
+                  await github.graphql(updateStatusMutation, {
+                    projectId: project.id,
+                    itemId,
+                    fieldId: statusField.id,
+                    optionId: option.id,
+                  });
+                  core.info(`Updated project status for item ${itemId} to "${label}".`);
+                } catch (error) {
+                  core.warning(`Failed to update project status for item ${itemId}: ${error.message}`);
+                }
+              }
+              if (errorField && typeof errorText === 'string') {
+                try {
+                  await github.graphql(updateTextMutation, {
+                    projectId: project.id,
+                    itemId,
+                    fieldId: errorField.id,
+                    text: errorText,
+                  });
+                } catch (error) {
+                  core.warning(`Failed to update error field for item ${itemId}: ${error.message}`);
+                }
+              }
+              if (runUrlField && runUrl) {
+                try {
+                  await github.graphql(updateTextMutation, {
+                    projectId: project.id,
+                    itemId,
+                    fieldId: runUrlField.id,
+                    text: runUrl,
+                  });
+                } catch (error) {
+                  core.warning(`Failed to update run URL field for item ${itemId}: ${error.message}`);
+                }
+              }
+            };
+
+            for (const entry of successEntries) {
+              await updateProjectStatus(entry, doneOption, statusDoneName, '');
+            }
+            if (!failedOption && failedEntries.length) {
+              core.warning(`Status option "${statusFailedName}" not found; updating error field only.`);
+            }
+            for (const entry of failedEntries) {
+              const rawError = entry.error ? String(entry.error) : 'unknown error';
+              const cleanError = rawError.replace(/\s+/g, ' ').trim();
+              await updateProjectStatus(entry, failedOption, statusFailedName, cleanError);
+            }
+
+  sync-rose-branch:
+    name: Sync rose/translations with main
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Merge default branch into rose/translations
+        shell: bash
+        env:
+          SOURCE_BRANCH: ${{ github.ref_name }}
+          TARGET_BRANCH: rose/translations
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin "$SOURCE_BRANCH"
+          if git show-ref --verify --quiet "refs/remotes/origin/$TARGET_BRANCH"; then
+            git fetch origin "$TARGET_BRANCH"
+            git checkout -B "$TARGET_BRANCH" "refs/remotes/origin/$TARGET_BRANCH"
+          else
+            git checkout -B "$TARGET_BRANCH" "refs/remotes/origin/$SOURCE_BRANCH"
+          fi
+
+          # Prefer main/master when conflicts occur to keep translations branch aligned with source.
+          git merge --no-edit -X theirs "refs/remotes/origin/$SOURCE_BRANCH"
+
+          local_head="$(git rev-parse HEAD)"
+          remote_head="$(git rev-parse "refs/remotes/origin/$TARGET_BRANCH" 2>/dev/null || true)"
+          if [[ -n "$remote_head" && "$local_head" == "$remote_head" ]]; then
+            echo "rose/translations already up to date with $SOURCE_BRANCH."
+            exit 0
+          fi
+          git push origin "$TARGET_BRANCH"
+
   guard:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     outputs:
       allowed: ${{ steps.permission_check.outputs.allowed }}
@@ -87,8 +1625,11 @@ jobs:
     name: Rose's Translation Pipeline
     environment: translations
     needs: guard
-    if: ${{ needs.guard.outputs.allowed == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.merged == true && needs.guard.outputs.merged_by_allowed == 'true')) }}
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.guard.outputs.allowed == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     env:
       N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL_TR }}
       ROSE_N8N_SENDING_TOKEN: ${{ secrets.N8N_SENDING_TOKEN || '' }}
@@ -198,7 +1739,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install PyYAML ruamel.yaml Babel
 
-      # 3) Kick off Rose's orchestrator (diff → n8n → verify → build).
+      # 3) Kick off Rose's orchestrator (diff -> n8n -> verify -> build).
       - name: Run Rose pipeline
         shell: bash
         run: |
