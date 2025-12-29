@@ -208,7 +208,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      projects: write
+      repository-projects: write
     env:
       ROSE_PROJECT_OWNER: ${{ vars.ROSE_PROJECT_OWNER || github.repository_owner }}
       ROSE_PROJECT_NUMBER: ${{ vars.ROSE_PROJECT_NUMBER || '' }}
@@ -548,7 +548,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      projects: write
+      repository-projects: write
     env:
       N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL_TR }}
       ROSE_N8N_SENDING_TOKEN: ${{ secrets.N8N_SENDING_TOKEN || '' }}
