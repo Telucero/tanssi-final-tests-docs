@@ -41,6 +41,7 @@ on:
 permissions:
   contents: read
 
+  
 env:
   # Repo variable name that stores translation languages (matches existing ROSE_LANGUAGES).
   ROSE_LANGS_VAR_NAME: ROSE_LANGUAGES
