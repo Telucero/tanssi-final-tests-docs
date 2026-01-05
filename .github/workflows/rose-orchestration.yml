@@ -276,7 +276,7 @@ jobs:
               `repo:${context.repo.owner}/${context.repo.repo}`,
               'is:pr',
               'is:merged',
-              'base:main',
+              'base:update-trigger',
               `label:${queueLabel}`,
               `-label:${sentLabel}`,
             ].join(' ');
