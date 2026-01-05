@@ -397,6 +397,14 @@ jobs:
           successes = []
           failures = []
 
+          def ensure_commit(sha: str) -> None:
+              if not sha:
+                  return
+              try:
+                  subprocess.run(["git", "cat-file", "-e", sha], check=True, stdout=subprocess.DEVNULL)
+              except subprocess.CalledProcessError:
+                  subprocess.run(["git", "fetch", "--depth=1", "origin", sha], check=True)
+
           for entry in entries:
               pr_number = entry.get("pr_number")
               base_sha = entry.get("base_sha")
@@ -411,6 +419,8 @@ jobs:
                   base_sha = subprocess.check_output(
                       ["git", "rev-parse", f"{merge_sha}^1"], text=True
                   ).strip()
+              ensure_commit(base_sha)
+              ensure_commit(merge_sha)
 
               diff_files = subprocess.check_output(
                   ["git", "diff", "--name-only", base_sha, merge_sha], text=True
