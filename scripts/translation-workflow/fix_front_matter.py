@@ -8,6 +8,7 @@ from pathlib import Path
 
 from paths import DOCS_ROOT, REPO_ROOT, repo_path
 from inject_translations import (
+    _is_language_dir,
     _restore_markdown_structure,
     _split_front_matter,
 )
