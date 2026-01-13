@@ -962,7 +962,13 @@ def _run_pipeline(args: argparse.Namespace) -> int:
         fix_front_matter_cmd += ["--languages", *args.languages]
     _run_cmd(fix_front_matter_cmd)
 
-    _run_cmd([PYTHON_BIN, str(CURRENT_DIR / "format_locale_yaml.py")])
+    has_locale_targets = any(
+        path.parts and path.parts[0] == "locale" for path in target_files
+    )
+    if has_locale_targets:
+        _run_cmd([PYTHON_BIN, str(CURRENT_DIR / "format_locale_yaml.py")])
+    else:
+        _debug("Skipping locale formatting: no locale files in payload.")
 
     payload_segments = _summarize_payload_segments(payload_entries)
 
