@@ -201,10 +201,13 @@ jobs:
     name: Process Rose PRs
     if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.file_filter == 'run_queue') }}
     runs-on: ubuntu-latest
+    outputs:
+      success_payload: ${{ steps.success_payload.outputs.payload }}
+      success_count: ${{ steps.process_queue.outputs.success_count }}
     permissions:
       actions: read
       contents: write
-      issues: write
+      issues: read
       pull-requests: read
     env:
       N8N_WEBHOOK_URL: ${{ secrets.N8N_WEBHOOK_URL_TR }}
@@ -550,6 +553,20 @@ jobs:
 
             await fs.promises.appendFile(process.env.GITHUB_STEP_SUMMARY, lines.join('\n'));
 
+      - name: Capture success payload
+        if: ${{ steps.process_queue.outputs.success_count != '0' }}
+        id: success_payload
+        shell: bash
+        env:
+          SUCCESS_FILE: ${{ steps.process_queue.outputs.success_file }}
+        run: |
+          if [[ -f "$SUCCESS_FILE" ]]; then
+            payload="$(base64 -w 0 "$SUCCESS_FILE")"
+            echo "payload=$payload" >> "$GITHUB_OUTPUT"
+          else
+            echo "payload=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Prepare temporary summary directory
         if: ${{ steps.process_queue.outputs.success_count != '0' }}
         id: temp_summary
@@ -632,26 +649,43 @@ jobs:
           fi
           echo "pushed=true" >> "$GITHUB_OUTPUT"
 
+  mark-sent:
+    name: Mark PRs as sent
+    if: ${{ needs.process-queue.result == 'success' && needs.process-queue.outputs.success_count != '0' }}
+    needs: process-queue
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    env:
+      ROSE_QUEUE_LABEL: rose
+      ROSE_SENT_LABEL: rose-sent
+    steps:
       - name: Mark PRs as sent
-        if: ${{ steps.process_queue.outputs.success_count != '0' }}
         uses: actions/github-script@v7
         env:
-          SUCCESS_FILE: ${{ steps.process_queue.outputs.success_file }}
-          ROSE_QUEUE_LABEL: ${{ env.ROSE_QUEUE_LABEL }}
-          ROSE_SENT_LABEL: ${{ env.ROSE_SENT_LABEL }}
+          SUCCESS_PAYLOAD: ${{ needs.process-queue.outputs.success_payload }}
         with:
           script: |
-            const fs = require('fs');
-
-            const successFile = process.env.SUCCESS_FILE;
+            const payload = process.env.SUCCESS_PAYLOAD || '';
             const queueLabel = (process.env.ROSE_QUEUE_LABEL || 'rose').toLowerCase();
             const sentLabel = (process.env.ROSE_SENT_LABEL || 'rose-sent').toLowerCase();
 
-            if (!successFile || !fs.existsSync(successFile)) {
+            if (!payload) {
               core.info('No successful entries found; skipping label updates.');
               return;
             }
-            const successEntries = JSON.parse(fs.readFileSync(successFile, 'utf8'));
+
+            let successEntries = [];
+            try {
+              const decoded = Buffer.from(payload, 'base64').toString('utf8');
+              successEntries = JSON.parse(decoded);
+            } catch (error) {
+              core.warning(`Failed to decode success payload: ${error.message}`);
+              return;
+            }
+
             if (!successEntries.length) {
               core.info('No successful entries found; skipping label updates.');
               return;
